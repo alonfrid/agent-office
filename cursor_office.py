@@ -38,7 +38,16 @@ Useful flags:
     python3 cursor_office.py --no-cursor       # hide Cursor agents (Claude Code only)
     python3 cursor_office.py --no-claude       # hide Claude Code agents (Cursor only)
     python3 cursor_office.py --demo            # add fake workers so the office is lively
+    python3 cursor_office.py --demo-working 12 # TEST HOOK: N synthetic WORKING agents
+                                               #   (implies --demo) -- verifies desk scaling
+    python3 cursor_office.py --holiday halloween   # force a holiday theme (demo/verify):
+                                               #   halloween|christmas|hanukkah|thanksgiving|newyear|none
+    python3 cursor_office.py --date 2026-12-24 # pretend it's this date when auto-theming
     python3 cursor_office.py --no-open         # don't auto-open the browser
+
+The office also AUTO-THEMES around holidays: from 7 days before through 3 days after
+Halloween, Thanksgiving (US), Hanukkah, Christmas and New Year's, the live scene shows
+that holiday's decorations. Overlapping windows (e.g. Christmas + New Year's) layer both.
 
 ------------------------------------------------------------------------------------
 SHARING WITH YOUR TEAM
@@ -54,11 +63,12 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
 import webbrowser
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote, urlparse
 
@@ -72,6 +82,55 @@ CURSOR_PROJECTS_DIR = os.path.expanduser("~/.cursor/projects")
 # shape as Cursor, so both sources feed the SAME office (each worker is tagged with
 # its `source` so the UI can tell a Cursor agent from a Claude Code agent).
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+
+# Cursor's own display name for a chat (the title shown in the sidebar) is NOT stored
+# in the .jsonl transcript -- it lives in Cursor's global SQLite state DB, under the
+# cursorDiskKV table at key "composerData:<uuid>", whose JSON value carries a "name"
+# field (e.g. "PR review for Tomer"). The <uuid> is exactly the transcript's filename
+# uuid. We read that so each office worker is labelled with the real session name
+# instead of the first line of its opening prompt. The DB is large and concurrently
+# written by Cursor, so we open it READ-ONLY and cache per-uuid with a short TTL rather
+# than touching it on every poll. Any failure falls back silently to the old behaviour.
+CURSOR_GLOBAL_DB = os.path.expanduser(
+    "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+)
+_SESSION_NAME_CACHE = {}          # uuid -> (name_or_"", fetched_at)
+_SESSION_NAME_LOCK = threading.Lock()
+_SESSION_NAME_TTL = 30            # seconds a resolved (or missing) name is trusted
+
+
+def cursor_session_name(uuid):
+    """Return Cursor's own sidebar display name for a chat `uuid`, or "" if none.
+
+    Looks up cursorDiskKV["composerData:<uuid>"].name in Cursor's global state DB,
+    read-only, with a small per-uuid TTL cache so we don't reopen the (large) DB on
+    every poll. Returns "" on any error / missing name so callers fall back cleanly.
+    """
+    now = time.time()
+    with _SESSION_NAME_LOCK:
+        hit = _SESSION_NAME_CACHE.get(uuid)
+        if hit and (now - hit[1]) < _SESSION_NAME_TTL:
+            return hit[0]
+    name = ""
+    try:
+        if os.path.isfile(CURSOR_GLOBAL_DB):
+            uri = "file:%s?mode=ro" % quote(CURSOR_GLOBAL_DB)
+            conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+            try:
+                cur = conn.execute(
+                    "SELECT json_extract(value,'$.name') FROM cursorDiskKV WHERE key=?",
+                    ("composerData:" + uuid,),
+                )
+                row = cur.fetchone()
+                if row and isinstance(row[0], str):
+                    name = row[0].strip()
+            finally:
+                conn.close()
+    except Exception:
+        name = ""   # fall back to the prompt-derived title
+    with _SESSION_NAME_LOCK:
+        _SESSION_NAME_CACHE[uuid] = (name, now)
+    return name
 
 # Office (working/desk) vs kitchen (waiting) is decided by TURN STATE, not raw
 # write-recency: a session is "working" while its latest turn is still IN PROGRESS
@@ -112,6 +171,126 @@ WATCH_MODE = False
 # workflow's full summary always stays in the chat's detail panel).
 SHOW_WORKFLOWS = True
 WORKFLOW_FRESH_SECONDS = 300
+
+# TEST HOOK: when > 0, the office is populated with exactly this many synthetic WORKING
+# agents (implies --demo) so the dynamic desk scaling can be verified. Set by --demo-working.
+DEMO_WORKING = 0
+
+# ------------------------------------------------------------------------------------
+# Holiday calendar -- the LIVE office auto-themes around holidays.
+# A holiday "themes" the office from 7 days BEFORE through 3 days AFTER its date,
+# inclusive (see holiday_active()). HOLIDAY_OVERRIDE / HOLIDAY_DATE force a theme or a
+# reference date for demos (set from --holiday / --date).
+HOLIDAY_OVERRIDE = None   # None -> use the real date; "none" -> force plain office; else a holiday name
+HOLIDAY_DATE = None       # datetime.date to treat as "today" (None -> real date.today())
+HOLIDAY_WINDOW_BEFORE = 7
+HOLIDAY_WINDOW_AFTER = 3
+# Hanukkah's first night follows the Hebrew (lunar) calendar, so there is no simple
+# Gregorian formula -- hardcode a small lookup of first-night (first candle, at sundown)
+# dates. APPROXIMATE: these were sanity-checked for 2025-2030 but should be re-verified
+# and EXTENDED every few years (the table drifts out of range otherwise).
+HANUKKAH_FIRST_NIGHT = {
+    2025: (12, 14), 2026: (12, 4), 2027: (12, 24),
+    2028: (12, 12), 2029: (12, 1), 2030: (12, 20),
+}
+
+
+def _thanksgiving_us(year):
+    """US Thanksgiving = the 4th Thursday of November, computed per year."""
+    first = date(year, 11, 1)
+    first_thu = 1 + (3 - first.weekday()) % 7   # weekday(): Mon=0..Thu=3
+    return date(year, 11, first_thu + 21)       # first Thursday + 3 weeks -> 4th Thursday
+
+
+def _holiday_dates(year):
+    """{name: date} of every supported holiday for a given year."""
+    out = {
+        "halloween": date(year, 10, 31),
+        "thanksgiving": _thanksgiving_us(year),
+        "christmas": date(year, 12, 25),
+        "newyear": date(year, 1, 1),
+    }
+    hk = HANUKKAH_FIRST_NIGHT.get(year)
+    if hk:
+        out["hanukkah"] = date(year, hk[0], hk[1])
+    return out
+
+
+def holiday_active(today):
+    """Return the holiday(s) whose [-7, +3] day window contains `today`, nearest-first.
+
+    Overlap rule: windows can co-occur (Hanukkah and Christmas often do), so we return
+    ALL active holidays rather than picking one. The frontend layers every theme's decor;
+    the FIRST (nearest-dated) name is what drives the single ambient scene tint, so tints
+    never fight. Neighbouring years are checked too, so a window near a year boundary works.
+    """
+    hits = []
+    for yr in (today.year - 1, today.year, today.year + 1):
+        for name, d in _holiday_dates(yr).items():
+            start = d - timedelta(days=HOLIDAY_WINDOW_BEFORE)
+            # Hanukkah is an 8-night festival, so its anchor date `d` is only the FIRST
+            # night; the +3 tail must hang off the LAST (8th) night = first_night + 7 days
+            # so the whole span stays themed. Other holidays keep the plain -7/+3 window.
+            tail_anchor = d + timedelta(days=7) if name == "hanukkah" else d
+            end = tail_anchor + timedelta(days=HOLIDAY_WINDOW_AFTER)
+            if start <= today <= end:
+                hits.append((abs((today - d).days), name))
+    hits.sort()
+    seen, out = set(), []
+    for _dist, name in hits:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def current_holidays():
+    """Active holiday names for the office right now, honouring --holiday / --date."""
+    if HOLIDAY_OVERRIDE is not None:
+        return [] if HOLIDAY_OVERRIDE == "none" else [HOLIDAY_OVERRIDE]
+    return holiday_active(HOLIDAY_DATE or date.today())
+
+
+def hanukkah_night(today):
+    """Which night of Hanukkah (1..8) `today` falls on, or None if it is outside the
+    eight-night span. Night 1 is the first candle-lighting at sundown on the first-night
+    date (e.g. Dec 4, 2026); night 8 is seven days later. Neighbouring years are checked
+    so a date near a year boundary still resolves."""
+    for yr in (today.year - 1, today.year, today.year + 1):
+        hk = HANUKKAH_FIRST_NIGHT.get(yr)
+        if not hk:
+            continue
+        first = date(yr, hk[0], hk[1])
+        delta = (today - first).days
+        if 0 <= delta <= 7:
+            return delta + 1
+    return None
+
+
+# When Hanukkah is forced (--holiday hanukkah) without an in-span --date, light this many
+# candles so the demo/forced render looks festive rather than night-1 sparse.
+HANUKKAH_DEMO_NIGHT = 5
+
+
+def current_hanukkah_night():
+    """Night (1..8) of Hanukkah the office should light right now, or None when Hanukkah
+    is not the/an active theme. Honours --holiday / --date exactly like current_holidays():
+    a real in-span --date uses the true night; a forced theme without an in-span date falls
+    back to a representative lit count so forced/demo renders look good."""
+    if HOLIDAY_OVERRIDE is not None:
+        if HOLIDAY_OVERRIDE != "hanukkah":
+            return None
+        if HOLIDAY_DATE is not None:
+            real = hanukkah_night(HOLIDAY_DATE)
+            if real is not None:
+                return real
+        return HANUKKAH_DEMO_NIGHT
+    today = HOLIDAY_DATE or date.today()
+    if "hanukkah" not in holiday_active(today):
+        return None
+    # Auto-themed: the true night inside the eight-night span; otherwise the theme is in its
+    # -7/+3 approach window (before the first candle) -> show night 1 as the opening night.
+    return hanukkah_night(today) or 1
 _WORKFLOW_SCRIPT_CACHE = {}     # script_path -> (mtime, meta_dict)
 _WORKFLOW_IDENTITY_CACHE = {}   # uuid -> (parent_mtime, {runId: {name,summary,scriptPath}})
 _WORKFLOW_JOURNAL_CACHE = {}    # run_dir -> ((mtime,size), {total,done,running_ids})
@@ -721,9 +900,10 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
         if ev["kind"] == "user" and ev["text"]:
             task_full = _strip_leading_timestamp(ev["text"]) or ev["text"]
             break
-    # a scheduled run's opener is the injected marker/context, so prefer the
-    # task's given name (mirrors the Claude source's title fallback).
-    title = (scheduled_name or task_full.split("\n")[0]).strip()
+    # Prefer Cursor's own sidebar name for the chat (the real session title) when we
+    # can resolve it from Cursor's state DB; otherwise fall back to the scheduled-task
+    # name, then the first line of the opening prompt (the historical behaviour).
+    title = (cursor_session_name(uuid) or scheduled_name or task_full.split("\n")[0]).strip()
     if len(title) > 70:
         title = title[:67].rstrip() + "..."
     if not title:
@@ -1660,8 +1840,57 @@ def get_agent_detail(uuid):
     return None
 
 
+def _demo_working_agents(n, now):
+    """TEST HOOK (--demo-working N): exactly N synthetic WORKING agents, all destined for
+    desks, so the dynamic desk scaling can be verified at any headcount."""
+    titles = [
+        "Refactor the data export pipeline", "Add pagination to the users API",
+        "Investigate the slow orders query", "Audit the payments service",
+        "Migrate the auth tokens to Auth0", "Wire up the websocket consumers",
+        "Backfill the audit log schema", "Tune the Celery beat schedule",
+        "Harden the file-converter uploads", "Index the provider search",
+    ]
+    out = []
+    for i in range(n):
+        uuid = "demo-work-%04d" % i
+        source = "cursor" if (i % 2 == 0) else "claude"
+        title = "%s #%d" % (titles[i % len(titles)], i + 1)
+        out.append({
+            "id": uuid,
+            "source": source,
+            "scheduled": False,
+            "subagents": [],
+            "subs": 0,
+            "shells": [],
+            "workflows": [],
+            "wf_running_agents": 0,
+            "self_active": True,
+            "name": _name_for(uuid),
+            "variant": _variant_for(uuid),
+            "project": "demo-scaling",
+            "status": "working",
+            "title": title,
+            "preview": title,
+            "latest": "Editing %s.py" % title.split()[1].lower(),
+            "latest_kind": "tool",
+            "last_tool": "Edit: service.py",
+            "last_message": "Working on " + title.split()[1].lower(),
+            "last_instruction": "Please " + title[0].lower() + title[1:],
+            "message_count": 9,
+            "model": "Opus 4.8" if source == "claude" else None,
+            "tokens": (820_000 if source == "claude" else None),
+            "spend": (2.11 if source == "claude" else None),
+            "mtime": now - 30,
+            "last_activity_rel": _rel_time(30),
+            "demo": True,
+        })
+    return out
+
+
 def demo_agents():
     now = time.time()
+    if DEMO_WORKING > 0:
+        return _demo_working_agents(DEMO_WORKING, now)
     # working agents / their live helpers occasionally "say" a new thing; each gets its own
     # slow, staggered clock so the office shows the odd bubble popping -- not a wall of them.
     def _blip(off, period=15):
@@ -1943,6 +2172,25 @@ PAGE = r"""<!DOCTYPE html>
   #dfoot button{flex:1 1 auto;font-family:inherit;font-size:8px;padding:9px 8px;cursor:pointer;
     border:1px solid var(--panel);border-radius:5px;background:var(--panel);color:var(--ink-hi);}
   #dfoot button.ghost{background:#fff;color:var(--card-ink);border-color:var(--card-line);}
+  /* kitchen list panel -- who's waiting (mirrors the detail overlay look) */
+  #koverlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(15,24,8,.55);padding:14px;z-index:21;}
+  #kdialog{width:100%;max-width:520px;max-height:100%;background:var(--card);
+    border:3px solid var(--panel);border-radius:8px;display:flex;flex-direction:column;
+    box-shadow:0 0 0 3px var(--panel-line), 0 18px 40px rgba(0,0,0,.5);overflow:hidden;}
+  #khead{background:var(--panel);color:var(--ink-hi);padding:12px 14px;
+    display:flex;justify-content:space-between;align-items:center;gap:8px;}
+  #khead .who{font-size:13px;color:var(--ink-hi);}
+  #khead button{font-family:inherit;background:var(--panel2);color:var(--ink-hi);
+    border:1px solid var(--panel-line);border-radius:4px;font-size:9px;padding:5px 8px;cursor:pointer;}
+  #kbody{padding:12px;overflow:auto;font-size:11px;color:var(--card-ink);}
+  #kbody .krow{background:#ffffff;border:1px solid var(--card-line);border-left:3px solid #8b8f99;
+    padding:9px 11px;border-radius:4px;margin-bottom:8px;cursor:pointer;}
+  #kbody .krow:hover{background:#f1f1f3;border-left-color:#4a4d56;}
+  #kbody .krow:last-child{margin-bottom:0;}
+  #kbody .k-ttl{font-size:11px;color:var(--card-ink);font-weight:bold;word-break:break-word;line-height:1.5;}
+  #kbody .k-msg{font-size:10px;color:var(--card-ink-lo);margin-top:4px;line-height:1.6;word-break:break-word;}
+  #kbody .k-empty{text-align:center;color:var(--card-ink-lo);padding:26px 10px;font-size:10px;line-height:2;}
   #toast{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);background:var(--panel);
     color:var(--ink-hi);font-size:8px;padding:7px 12px;border-radius:5px;display:none;z-index:30;}
   #empty{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;
@@ -1984,6 +2232,15 @@ PAGE = r"""<!DOCTYPE html>
               <button id="d-open">OPEN TRANSCRIPT FILE (.jsonl)</button>
               <button id="d-copy" class="ghost">COPY SESSION ID</button>
             </div>
+          </div>
+        </div>
+        <div id="koverlay">
+          <div id="kdialog">
+            <div id="khead">
+              <div class="who" id="k-title">In the kitchen</div>
+              <button id="k-x" title="close">X</button>
+            </div>
+            <div id="kbody"></div>
           </div>
         </div>
         <div id="toast"></div>
@@ -2113,7 +2370,10 @@ function featuresForAgent(a){
 
 let agents = [];      // raw from server
 let people = [];      // live sprites with positions
-let deskSlots = [];   // fixed office desks (always drawn; some hold a worker)
+let deskSlots = [];   // office desks (always drawn; some hold a worker). Each: {x,y,scale,room,worker}
+let officeRooms = []; // labeled desk clusters drawn as light "work rooms" once the grid is large
+let activeHolidays = []; // holiday theme names active right now (from the server; see refresh())
+let hanukkahNight = 5;   // which night of Hanukkah (1..8) to light; from the server (see refresh())
 let helperHits = [];  // per-frame hover regions for the subagent dwarves
 let workflowHits = []; // per-frame hover regions for the workflow tents
 let shellHits = [];    // per-frame hover regions for the open-shell terminal windows
@@ -2173,7 +2433,7 @@ const DROWN_SINK_MS = 1500;   // how long an agent takes to slip under once it r
 // One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
 // the same rAF clock so it can't drift like a stray setInterval. These critters live
 // ONLY in the animation layer: pick(), hover, confetti and polling never see them.
-let amb = { dog:null, cat:null, plane:null };   // at most one of each on screen
+let amb = { dog:null, cat:null, plane:null, turkeys:null };   // at most one dog/cat/plane; a little turkey flock on Thanksgiving
 let nextEventAt = 0;                // performance.now() ms of the next event
 let lastEventType = null;           // avoid firing the same type twice in a row
 let nextPlaneAt = 0;                // performance.now() ms of the next window fly-by
@@ -2203,6 +2463,91 @@ function layout(){
     kitchenTop: H-kitchenH
   };
 }
+
+// On-screen footprint of ONE desk pod (worker + chair + name-plate) at drawing scale 1.0.
+// Used to scale desks down so they stay non-overlapping as the grid packs tighter.
+const DESK_FOOT_W = 48, DESK_FOOT_H = 56;
+// Build the office desk grid for `n` desks. At n<=6 it is the original fixed 2x3 pod
+// layout (unchanged look + seat stability). Above that it computes a grid whose column
+// count roughly matches the floor's aspect, scales the pods down to fit each cell, and
+// -- once it's large -- groups the columns into light, labeled "work rooms".
+function deskGrid(n, L){
+  if(n<=6){
+    const cols=3, need=6, left=140, right=W-140, top=WALL_H+48, rowH=128;
+    const slots=[];
+    for(let i=0;i<need;i++){ const c=i%cols, r=Math.floor(i/cols);
+      slots.push({ x:left+c*((right-left)/(cols-1)), y:top+r*rowH, scale:SC, room:0, worker:null }); }
+    return { slots, rooms:[], cols, rows:2 };
+  }
+  // usable office floor for desks: leave headroom under the windows and a margin above
+  // the kitchen so a docked worker + its name-plate never cross into the next room/zone.
+  const padX=70, padTop=WALL_H+40, padBot=L.kitchenTop-36;
+  const usableW = (W - padX) - padX;
+  const usableH = padBot - padTop;
+  // pick a column count whose cell aspect roughly matches the floor, then recompute from
+  // the resulting row count so the final row isn't left nearly empty.
+  let cols = Math.max(3, Math.round(Math.sqrt(n * usableW / usableH)));
+  let rows = Math.ceil(n / cols);
+  cols = Math.ceil(n / rows);
+  const colSpace = cols>1 ? usableW/(cols-1) : 0;
+  const rowSpace = rows>1 ? usableH/(rows-1) : 0;
+  // shrink the pods so a full cell fits with a small gap; never bigger than the original
+  // SC, floored so sprites/text stay legible even in a very crowded office.
+  let scale = SC;
+  if(cols>1) scale = Math.min(scale, colSpace*0.92/DESK_FOOT_W);
+  // leave extra vertical room so a desk's name-plate never grazes the row below it
+  if(rows>1) scale = Math.min(scale, rowSpace*0.74/DESK_FOOT_H);
+  scale = Math.max(0.6, scale);
+  const slots=[];
+  for(let i=0;i<n;i++){
+    const c=i%cols, r=Math.floor(i/cols);
+    const x = cols>1 ? (padX + c*colSpace) : W/2;
+    const y = rows>1 ? (padTop + r*rowSpace) : (padTop + usableH/2);
+    slots.push({ x:Math.round(x), y:Math.round(y), scale, room:0, worker:null });
+  }
+  // once the office has grown tall AND wide, split the columns into a few labeled rooms
+  // (light dividers + a small tag) so a big grid reads as intentional "work rooms".
+  const rooms=[];
+  if(rows>=3 && cols>=4){
+    const names=['A','B','C','D','E'];
+    const rc=Math.min(names.length, Math.max(2, Math.round(cols/4)));
+    const base=Math.floor(cols/rc), extra=cols%rc;
+    let start=0;
+    for(let g=0; g<rc; g++){
+      const cnt=base+(g<extra?1:0), c0=start, c1=start+cnt-1; start+=cnt;
+      // panel spans the gaps on either side of the room's outer columns
+      const xL=(c0===0) ? 0 : padX+(c0-0.5)*colSpace;
+      const xR=(c1===cols-1) ? W : padX+(c1+0.5)*colSpace;
+      rooms.push({ x0:Math.round(xL), x1:Math.round(xR), cx:Math.round((xL+xR)/2),
+                   label:'ROOM '+names[g] });
+      slots.forEach((s,si)=>{ const c=si%cols; if(c>=c0 && c<=c1) s.room=g; });
+    }
+  }
+  return { slots, rooms, cols, rows };
+}
+
+// light "work rooms": alternating translucent floor panels + soft dividers that group the
+// desks into labeled clusters. Drawn behind the desks (so it reads through the floor gaps)
+// once the grid has grown tall + wide; invisible for the small default office.
+function drawRooms(){
+  if(!officeRooms.length) return;
+  const L=layout(), y0=WALL_H, y1=L.kitchenTop;
+  ctx.save();
+  for(let i=0;i<officeRooms.length;i++){
+    const rm=officeRooms[i];
+    // alternating panel tint so neighbouring rooms separate at a glance
+    ctx.fillStyle = (i&1) ? 'rgba(255,255,255,.06)' : 'rgba(30,24,40,.10)';
+    ctx.fillRect(rm.x0, y0, rm.x1-rm.x0, y1-y0);
+    if(i>0){                                    // soft divider "wall" between rooms
+      ctx.fillStyle='rgba(30,24,40,.22)'; ctx.fillRect(rm.x0-1, y0, 2, y1-y0);
+      ctx.fillStyle='rgba(255,255,255,.10)'; ctx.fillRect(rm.x0+1, y0, 1, y1-y0);
+    }
+  }
+  ctx.restore();
+}
+
+// desk scale for a WORK person (seated or walking in); SC for everyone else.
+function pscale(p){ return (p && p.kind==='work' && p.deskScale) ? p.deskScale : SC; }
 
 // assign stable positions: desks for workers (grid), wander targets for waiters
 function rebuild(){
@@ -2239,20 +2584,16 @@ function rebuild(){
   const usedBeach = new Set(Object.values(beachAssign));
   beachers.forEach(a=>{ if(beachAssign[a.id]==null){ let i=0; while(usedBeach.has(i)) i++; beachAssign[a.id]=i; usedBeach.add(i); } });
 
-  // a fixed office layout of desks that is ALWAYS drawn (so the room looks
-  // furnished even when nobody is working). Sized to fit the highest used slot.
-  const cols = 3;
+  // a desk layout that is ALWAYS drawn (so the room looks furnished even when nobody
+  // is working) AND that GROWS so the office never runs out of desks: as the working
+  // headcount passes the cozy 6-desk default we add rows/columns and scale the desks
+  // (plus the agents sitting at them) down to fit the floor. deskGrid() reproduces the
+  // original 2x3 layout byte-for-byte at <=6, so small offices look exactly as before.
   const maxSlot = Object.values(deskAssign).reduce((m,v)=>Math.max(m,v), -1);
-  const need = Math.max(6, Math.ceil((maxSlot+1)/cols)*cols);
-  // tighter grid sized for the bigger (SC) desks so the office reads as full
-  const left = 140, right = W-140, top = WALL_H+48, rowH = 128;   // wider insets (edge desks fit their dwarves/easels) + taller rows (more gap between the 2 rows)
-  deskSlots = [];
-  for(let i=0;i<need;i++){
-    const c=i%cols, r=Math.floor(i/cols);
-    const x = left + c*((right-left)/(cols-1));
-    const y = top + r*rowH;
-    deskSlots.push({x, y, worker:null});
-  }
+  const nWork = Math.max(6, maxSlot + 1);         // desks to lay out (>=6, always full)
+  const grid = deskGrid(nWork, L);
+  deskSlots = grid.slots;                          // [{x,y,scale,room,worker:null}, ...]
+  officeRooms = grid.rooms;                         // labeled column clusters (empty unless large)
   // where a just-un-drowned agent climbs back out of the sea: mid-ocean band, mid-beach height
   const SEA = { x: SHORE_X + Math.round(WATER_W*0.5), y: L.kitchenTop + Math.round((H-L.kitchenTop)*0.45) };
   workers.forEach(a=>{
@@ -2266,7 +2607,7 @@ function rebuild(){
       id:a.id, agent:a, kind:'work',
       // keep current position so a kitchen->desk move animates as a walk
       x: old? old.x : (emerging? SEA.x : slot.x), y: old? old.y : (emerging? SEA.y : slot.y),
-      deskX:slot.x, deskY:slot.y, vx:0, vy:0,
+      deskX:slot.x, deskY:slot.y, deskScale:slot.scale, vx:0, vy:0,
       seated: old ? !!sameSeat : (emerging? false : true),   // emergers walk up from the water
       seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     });
@@ -3570,7 +3911,8 @@ function drawDrowning(p, st){
 
 // a full workstation: office chair + desk + monitor + filing cabinet + plant,
 // with (optionally) a worker seated behind it, facing us. Even empty it looks furnished.
-function drawDeskPod(x, y, p, t){
+function drawDeskPod(x, y, p, t, sc){
+  sc = sc || SC;   // the pod is drawn scaled by `sc` about (x,y); hit regions convert with it
   const f = p ? (p.feat||featuresFor(p.id)) : null;
   // a seated worker "works" (types, its screen animates, its mug steams) only while its OWN
   // turn is active; when it is merely working because a subagent / workflow is live it sits
@@ -3650,13 +3992,16 @@ function drawDeskPod(x, y, p, t){
   // mug on the desk; steam rises only while the worker is actively at its own turn
   if(p){ mug(x+3, y-1, PAL.mugC);
     if(selfActive) for(let i=0;i<3;i++){ const yy=y-3-((t*1.0+i*5)%8); px(x+5,yy,1,2,'rgba(255,255,255,.5)'); } }
-  // desk name-plate: the agent's task on a little white placard in front of the desk,
-  // white-board look like the workflow easel; wrapped by LETTER (packs the most text in)
-  // in a slightly smaller font (item 7).
+  // desk name-plate: the agent's title on a little white placard in front of the desk,
+  // white-board look like the workflow easel. Wrapped on WORD boundaries (never mid-word)
+  // and the plate is sized to the longest measured line, so short/medium titles sit on one
+  // line and long ones wrap to at most 2 lines (last line '…'-truncated at a word boundary).
   if(p && p.agent && p.agent.title){
     ctx.font='4px "Press Start 2P", monospace';
-    const plLines = wrapChars(p.agent.title, 50, 2, '');       // no trailing ellipsis
-    const pw=56, ph=5*plLines.length+3, plx=x-pw/2, ply=y+30;   // centered, below the chair wheels
+    const PL_MAXW=84;                                          // max line width -> fits ~"Medication selection"
+    const plLines = wrapWords(p.agent.title, PL_MAXW, 2);
+    let tw=0; for(const ln of plLines) tw=Math.max(tw, ctx.measureText(ln).width);
+    const pw=Math.round(tw)+10, ph=5*plLines.length+3, plx=Math.round(x-pw/2), ply=y+30;  // centered under the desk
     ro(plx, ply, pw, ph, PAL.paper);                            // white plate + dark ro() outline
     px(plx+1, ply+1, pw-2, 1, shade(PAL.paper,-.08));
     ctx.fillStyle=PAL.ink; ctx.textAlign='center';
@@ -3672,17 +4017,17 @@ function drawDeskPod(x, y, p, t){
     for(let i=0;i<n;i++){
       const cx=x-40-i*22, cy=y+15;
       drawHelper(cx, cy, t, (hash(p.id)+i*7)%997);
-      // pod is drawn scaled by SC about (x,y); convert the dwarf centre to mouse-logical coords
-      helperHits.push({ x: x+(cx-x)*SC, y: y+((cy-6)-y)*SC, r: 15*SC, sub: subs[i]||null });
+      // pod is drawn scaled by `sc` about (x,y); convert the dwarf centre to mouse-logical coords
+      helperHits.push({ x: x+(cx-x)*sc, y: y+((cy-6)-y)*sc, r: 15*sc, sub: subs[i]||null });
       const sb0 = subs[i] && subs[i].id ? subBubbles[subs[i].id] : null;
       if(sb0){ const lo=(i&1)===1;   // stagger: even dwarf -> above the hat, odd -> below the face
-        bubbleAnchors.push({ x: x+(cx-x)*SC, y: y+((cy+(lo?2:-15))-y)*SC, text:sb0.text, start:sb0.start, until:sb0.until, below:lo, tool:sb0.tool }); }
+        bubbleAnchors.push({ x: x+(cx-x)*sc, y: y+((cy+(lo?2:-15))-y)*sc, text:sb0.text, start:sb0.start, until:sb0.until, below:lo, tool:sb0.tool }); }
     }
   }
   // dynamic-workflow easel (drawn beside the desk; returns its hover hit centre)
   if(p && p.agent && p.agent.workflows && p.agent.workflows.length){
-    const hit = drawWorkflowTent(x, y, p.agent.workflows, t);
-    if(hit) workflowHits.push({ x: x+(hit.x-x)*SC, y: y+(hit.y-y)*SC, r: hit.r*SC, workflow: p.agent.workflows });
+    const hit = drawWorkflowTent(x, y, p.agent.workflows, t, sc);
+    if(hit) workflowHits.push({ x: x+(hit.x-x)*sc, y: y+(hit.y-y)*sc, r: hit.r*sc, workflow: p.agent.workflows });
   }
   // open background shells: up to 3 tiny terminal windows in a row just above the desk
   // name-plate, filling left -> middle -> right. Hover shows the command + output tail.
@@ -3693,7 +4038,7 @@ function drawDeskPod(x, y, p, t){
       // order the shells were opened. 22px pitch on 17px windows -> ~5px gap between them.
       const slot=n-1-i, sx=x-30+slot*22, sy=y+8;    // row bottom (sy+12) clears the name-plate (y+30) with a ~10px local gap
       drawShellWin(sx, sy, t, (hash(p.id)+i*5)%997);
-      shellHits.push({ x: x+((sx+8)-x)*SC, y: y+((sy+6)-y)*SC, r: 11*SC, shell: shells[i] });
+      shellHits.push({ x: x+((sx+8)-x)*sc, y: y+((sy+6)-y)*sc, r: 11*sc, shell: shells[i] });
     }
   }
 }
@@ -3756,7 +4101,8 @@ function humanizeWf(s){
   if(!s) return 'Workflow';
   return s.split(' ').map(w => (w===w.toUpperCase() ? w : (w[0].toUpperCase()+w.slice(1)))).join(' ');
 }
-function drawWorkflowTent(x, y, workflows, t){
+function drawWorkflowTent(x, y, workflows, t, sc){
+  sc = sc || SC;   // matches the desk pod's draw scale, for hit-region conversion
   if(!workflows || !workflows.length) return null;   // backend already gates to genuinely-live runs
   // a WHITE whiteboard (like the wall inspiration board), floating a few px above the desk
   // on easel legs. Always to the RIGHT of the desk with a small horizontal gap so it reads
@@ -3801,10 +4147,10 @@ function drawWorkflowTent(x, y, workflows, t){
     // each easel dwarf IS a running workflow subagent -> its own hover region showing what
     // it's doing (not the whole-workflow tooltip). Small radius so the board still hovers
     // as the workflow; the easel hit below is shrunk to the board so these win at the base.
-    helperHits.push({ x: x+(hx-x)*SC, y: y+((hy-4)-y)*SC, r: 10*SC, sub: acts[i]||null });
+    helperHits.push({ x: x+(hx-x)*sc, y: y+((hy-4)-y)*sc, r: 10*sc, sub: acts[i]||null });
     const sbw = acts[i] && acts[i].id ? subBubbles[acts[i].id] : null;
     if(sbw){ const lo=(i&1)===1;   // stagger easel dwarves: even -> above the hat, odd -> below the face
-      bubbleAnchors.push({ x: x+(hx-x)*SC, y: y+((hy+(lo?1:-12))-y)*SC, text:sbw.text, start:sbw.start, until:sbw.until, below:lo, tool:sbw.tool }); }
+      bubbleAnchors.push({ x: x+(hx-x)*sc, y: y+((hy+(lo?1:-12))-y)*sc, text:sbw.text, start:sbw.start, until:sbw.until, below:lo, tool:sbw.tool }); }
   }
   return { x: cxT, y: y-26, r: 26 };   // hit only the board face, not the dwarves at its base
 }
@@ -3858,6 +4204,36 @@ function wrapChars(text, maxW, maxLines, ell){
     return out;
   }
   return lines;
+}
+
+// greedy WORD wrap to a pixel width: packs whole words per line (never splits mid-word)
+// using the CURRENT ctx.font. A single word wider than maxW is hard-broken as a fallback.
+// On overflow past maxLines the last line is truncated at a word boundary with an ellipsis.
+function wrapWords(text, maxW, maxLines){
+  const fits = s => ctx.measureText(s).width <= maxW;
+  const words = String(text).replace(/\s+/g,' ').trim().split(' ').filter(Boolean);
+  // split any over-long word into pieces that each fit, so nothing can overflow the box
+  const toks=[];
+  for(const w of words){
+    if(fits(w)){ toks.push(w); continue; }
+    let cur='';
+    for(const ch of w){ if(cur && !fits(cur+ch)){ toks.push(cur); cur=''; } cur+=ch; }
+    if(cur) toks.push(cur);
+  }
+  const lines=[]; let cur='';
+  for(const tk of toks){ const test=cur?cur+' '+tk:tk;
+    if(cur && !fits(test)){ lines.push(cur); cur=tk; } else cur=test; }
+  if(cur) lines.push(cur);
+  if(!maxLines || lines.length<=maxLines) return lines;
+  // overflow: keep the first maxLines-1 lines whole, then pack the rest into the last line
+  // with a trailing '…', dropping whole words (never cutting one) until it fits.
+  const out=lines.slice(0,maxLines-1);
+  const rest=lines.slice(maxLines-1).join(' ').split(' ').filter(Boolean);
+  let last='';
+  for(const tk of rest){ const test=last?last+' '+tk:tk; if(last && !fits(test+'…')) break; last=test; }
+  if(!last){ last=rest[0]||''; while(last.length>1 && !fits(last+'…')) last=last.slice(0,-1); }
+  out.push(last+'…');
+  return out;
 }
 
 // first ~90 chars, whitespace-collapsed (drawBubble wraps + ellipsizes the rest)
@@ -4214,6 +4590,509 @@ function tick(now){
 // the one "talking" -- the agent's own speech bubble is suppressed so they don't both pop one.
 function bossActive(id){ const b=bossVisits[id]; return !!(b && b.until>performance.now()); }
 
+// ============================ HOLIDAY THEMES =================================
+// The live office auto-themes around holidays (see holiday_active() in the backend).
+// `activeHolidays` is the list of theme names currently in window; here we render the
+// decorations. Everything is PURE SCENERY -- never hit-tested, never clickable (just
+// like the ambient dog/cat/plane) -- so hover/click/walking/FX are untouched. All props
+// are drawn in drawHolidayBack() BEFORE the desks, so desks + agents paint on top of
+// them; the falling "weather" is a light overlay drawn last. Kept sound-free.
+
+// a swagged string of holiday lights hung along the back wall, with gently twinkling bulbs
+function drawLightString(topY, bulbCols, t){
+  const seg=66, n=Math.ceil(W/seg);
+  ctx.save(); ctx.strokeStyle='rgba(40,35,30,.45)'; ctx.lineWidth=1;
+  for(let i=0;i<n;i++){
+    const x0=i*seg, x1=Math.min(W,(i+1)*seg), mx=(x0+x1)/2, dip=topY+11;
+    ctx.beginPath(); ctx.moveTo(x0,topY); ctx.quadraticCurveTo(mx,dip,x1,topY); ctx.stroke();
+    const col=bulbCols[i%bulbCols.length];
+    const on=((Math.floor(t*0.05)+i)%5)!==0;        // most bulbs lit, an occasional dark one
+    if(on){ ctx.globalAlpha=.3; px(mx-2,dip-2,5,6,col); ctx.globalAlpha=1;
+            px(mx-1,dip-1,3,5,col); px(mx-1,dip-1,1,1,'#ffffff'); }
+    else  { px(mx-1,dip-1,3,5,shade(col,-.5)); }
+  }
+  ctx.restore();
+}
+
+// --- Halloween: jack-o-lanterns, cobwebs, bats ---
+function drawPumpkin(x,by){
+  const o='#e07a2f', od='#b85e20', oh='#f0a24d';
+  px(x-9,by-10,18,12,o); px(x-11,by-7,22,6,o);          // squat body (wide middle)
+  px(x-9,by-10,18,2,oh); px(x-11,by-1,22,2,od);
+  px(x-4,by-10,1,13,od); px(x+3,by-10,1,13,od);          // ribs
+  px(x-1,by-13,3,4,'#5a7a3a');                           // stem
+  px(x-6,by-6,3,3,'#1a1208'); px(x+3,by-6,3,3,'#1a1208');// triangle eyes
+  px(x-5,by-1,10,2,'#1a1208'); px(x-5,by-3,2,2,'#1a1208'); px(x+3,by-3,2,2,'#1a1208'); // jagged grin
+  ctx.save(); ctx.globalAlpha=.5;                         // inner candle glow
+  px(x-6,by-6,3,3,'#ffcf6b'); px(x+3,by-6,3,3,'#ffcf6b'); px(x-5,by-1,10,2,'#ffcf6b'); ctx.restore();
+}
+function drawCobweb(cx,cy,flip){
+  ctx.save(); ctx.strokeStyle='rgba(232,232,242,.42)'; ctx.lineWidth=1;
+  const dir=flip?-1:1, R=[10,19,28,37];
+  for(let a=0;a<=4;a++){ const ang=a/4*(Math.PI/2);
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+dir*Math.cos(ang)*38, cy+Math.sin(ang)*38); ctx.stroke(); }
+  for(const r of R){ ctx.beginPath();
+    for(let a=0;a<=8;a++){ const ang=a/8*(Math.PI/2), vx=cx+dir*Math.cos(ang)*r, vy=cy+Math.sin(ang)*r;
+      if(a===0) ctx.moveTo(vx,vy); else ctx.lineTo(vx,vy); } ctx.stroke(); }
+  ctx.restore();
+}
+function drawBat(x,y,flap){
+  const c='#15101c';
+  px(x-1,y,3,4,c); px(x-1,y-2,3,2,c);                    // little body + ears
+  if(flap){ px(x-6,y-1,5,2,c); px(x+2,y-1,5,2,c); px(x-8,y-2,2,1,c); px(x+6,y-2,2,1,c); }
+  else    { px(x-6,y+1,5,2,c); px(x+2,y+1,5,2,c); px(x-8,y+2,2,1,c); px(x+6,y+2,2,1,c); }
+}
+function drawBats(t){
+  for(let i=0;i<5;i++){
+    const prog=((t*0.004 + i*0.21)%1), x=prog*(W+40)-20, y=38+i*15+Math.sin(t*0.02+i)*9;
+    drawBat(x|0, y|0, (Math.floor(t*0.1)+i)&1);
+  }
+}
+
+// --- Christmas: tree + gifts, snow ---
+function triFill(cx, topY, h, halfBase, col){
+  for(let i=0;i<h;i++){ const w=Math.max(1,Math.round(halfBase*2*(i+1)/h));
+    px(cx-Math.floor(w/2), topY+i, w, 1, col); }
+}
+// A big, lush Christmas tree: four shaded tiers, a glowing beaded garland that spirals the
+// tree, twinkling multi-colour lights, hanging ornaments, a bright animated topper star and
+// a little pile of wrapped gifts at the base. `t` drives the twinkle so it feels alive.
+function drawXmasTree(x, by, t, s){
+  s = s || 1;                                                        // `s` scales the whole tree up about its base (x,by)
+  ctx.save();
+  if(s!==1){ ctx.translate(x, by); ctx.scale(s, s); ctx.translate(-x, -by); } // grow taller/wider while staying planted on the floor
+  // sturdy trunk with a pot/stand
+  px(x-5, by-10, 10, 12, '#6b3f22'); px(x-5,by-10,10,2,'#7d4f2a'); px(x-5,by,10,2,'#54301a');
+  ro(x-11, by, 22, 6, '#8a2f2f'); px(x-11,by,22,2,'#b44545');                 // red tree-stand/skirt
+  const g='#2f7a3c', gD='#236030', gH='#3f9a4c';
+  // four cascading tiers (top -> bottom), each wider than the one above
+  triFill(x, by-80, 13, 16, gD); triFill(x, by-80, 13, 15, g);
+  triFill(x, by-62, 17, 22, gD); triFill(x, by-62, 17, 21, g);
+  triFill(x, by-42, 20, 26, gD); triFill(x, by-42, 20, 25, g);
+  triFill(x, by-20, 22, 30, gD); triFill(x, by-20, 22, 29, g);
+  // snow dusting on the front of each tier
+  ctx.save(); ctx.globalAlpha=.55;
+  triFill(x, by-80, 4, 4, '#ffffff'); triFill(x, by-62, 4, 7, '#eef4ff');
+  triFill(x, by-42, 4, 10, '#eef4ff'); triFill(x, by-20, 4, 13, '#eef4ff');
+  ctx.restore();
+  // a few lighter needle highlights so the tiers aren't flat
+  ctx.save(); ctx.globalAlpha=.4;
+  for(let i=0;i<22;i++){ const ty=by-78+((i*53)%74), hw=2+((i*13)%6);
+    px(x-hw, ty, hw*2, 1, gH); }
+  ctx.restore();
+  // spiralling bead garland (gold) -- a zig-zag down the tree
+  const garC='#f2dd88';
+  for(let i=0;i<30;i++){ const ty=by-76+i*2.6, sw=4+(ty-(by-80))*0.26;
+    const gx=x+Math.sin(i*0.9)*sw; px(gx|0, ty|0, 2,1, garC); }
+  // twinkling lights: warm + multi-colour, a slow per-bulb blink off the clock
+  const lc=['#ffdf6b','#ff5a5a','#5ab0ff','#5ae07a','#ff8ad0'];
+  for(let i=0;i<30;i++){
+    const ang=i*2.3, ty=by-76+((i*37)%92), sw=4+(ty-(by-80))*0.24;
+    const lx=x+Math.cos(ang)*sw, col=lc[i%lc.length];
+    const on=((Math.floor(t*0.18)+i)%3)!==0;                           // most lit, some winking off
+    if(on){ ctx.save(); ctx.globalAlpha=.4; px((lx-1)|0,(ty-1)|0,4,4,col); ctx.restore();
+            px(lx|0, ty|0, 2,2, col); px(lx|0, ty|0, 1,1, '#ffffff'); }
+    else  { px(lx|0, ty|0, 2,2, shade(col,-.55)); }
+  }
+  // bigger hanging ornament baubles with a highlight dot
+  const oc=['#e23b3b','#f0c33b','#3fa0e0','#e673a8','#b54fd0','#ffffff'];
+  const orn=[[-14,-24],[11,-30],[-9,-46],[8,-50],[-5,-64],[6,-66],[0,-36],[-16,-10],[13,-12],[-2,-74]];
+  for(let i=0;i<orn.length;i++){ const ox=x+orn[i][0], oy=by+orn[i][1], c=oc[i%oc.length];
+    px(ox-1,oy-2,2,1,'#d4af37');                                       // cap
+    ro(ox-2, oy, 4,4, c); px(ox-1,oy,1,1,shade(c,.5)); }
+  // animated topper star with a soft glow pulse
+  const pulse=0.5+0.5*Math.sin(t*0.12), sy=by-92;
+  ctx.save(); ctx.globalAlpha=.35+0.25*pulse; px(x-4,sy-1,10,6,'#ffe066'); px(x-1,sy-5,4,14,'#ffe066'); ctx.restore();
+  px(x-1,sy-4,2,12,'#ffe066'); px(x-5,sy+2,12,2,'#ffe066');            // star arms
+  px(x-3,sy,6,6,'#fff6b0'); px(x-1,sy+1,2,2,'#ffffff');                 // bright core
+  // a little pile of wrapped gifts tucked under the tree
+  ro(x+13, by-2, 13, 10, '#c0392b'); px(x+13,by-2,13,2,'#e05a4d'); px(x+18,by-2,2,10,'#f0c33b'); px(x+16,by-4,6,2,'#f0c33b');
+  ro(x-29, by, 11, 8, '#2f74d6'); px(x-25,by,1,8,'#ffd84d'); px(x-29,by,11,2,'#5a9ae0');
+  ro(x-15, by+1, 9, 7, '#2f8a4c'); px(x-11,by+1,1,7,'#ffffff'); px(x-15,by+1,9,2,'#49a86a');
+  ctx.restore();
+}
+function drawSnow(t, col){
+  ctx.save();
+  for(let i=0;i<70;i++){
+    const sp=0.4+((i*7)%10)/10*0.6;
+    const y=((t*sp*6 + i*53) % (H+20)) - 10;
+    const x=((i*97)%W) + Math.sin((t*0.01)+i)*6;
+    const big=(i%4===0);
+    ctx.globalAlpha=0.5+((i%3)*0.16);
+    px(x|0, y|0, big?2:1, big?2:1, col);
+  }
+  ctx.restore();
+}
+
+// --- Hanukkah: a big, colourful menorah that lights the correct number of candles for
+// tonight (`lit` = the night 1..8, computed server-side), PLUS the raised central shamash
+// which is always lit. Unlit candles read clearly dark; lit ones carry a warm glowing flame.
+// A single lit flame per candle; `t` drives a gentle per-flame flicker.
+function drawMenorah(x, by, lit, t, s){
+  s = s || 1;                                                        // `s` scales the whole menorah up about its base (x,by)
+  ctx.save();
+  if(s!==1){ ctx.translate(x, by); ctx.scale(s, s); ctx.translate(-x, -by); } // grow branches/candles/flames together, still planted on the floor
+  const gold='#d4af37', goldH='#f2dd88', goldD='#9c7d1f';
+  // ornate base: stepped foot + stem + arm bar, all with a top highlight + lower shadow line
+  px(x-26,by+2,52,5,goldD); px(x-22,by-3,44,6,gold); px(x-22,by-3,44,1,goldH);  // foot
+  px(x-4,by-30,8,28,gold); px(x-4,by-30,2,28,goldH); px(x+2,by-30,2,28,goldD);  // central stem
+  px(x-30,by-30,60,3,gold); px(x-30,by-30,60,1,goldH); px(x-30,by-27,60,1,goldD); // arm bar
+  // the eight branch candles (i=-4..-1 and 1..4) + the raised shamash (i=0)
+  const candC=['#d94f4f','#4f7fd9','#49a86a','#e0b23a','#b45fd0','#e07aae','#4fbfc0','#e08a3a'];
+  // on night `lit` we kindle `lit` candles. Fill from the right arm inward (i=4,3,2,1 then
+  // -1,-2,-3,-4) so night 1 is a single candle and night 8 lights them all.
+  const order=[4,3,2,1,-1,-2,-3,-4];
+  const onSet={}; for(let k=0;k<lit && k<order.length;k++) onSet[order[k]]=true;
+  for(let i=-4;i<=4;i++){
+    const cx=x+i*6, isSham=(i===0), extra=isSham?10:0, cup=by-30;
+    const on=isSham || !!onSet[i];
+    px(cx-2, cup-6-extra, 4, 7+extra, gold); px(cx-2,cup-6-extra,1,7+extra,goldH); // riser/cup
+    const cc=isSham?'#f2f2e0':candC[(i+4)%candC.length];                          // coloured candle
+    px(cx-2, cup-11-extra, 5, 5, cc); px(cx-2, cup-11-extra, 5, 1, shade(cc,.4)); // candle wax
+    px(cx+2, cup-10-extra, 1, 4, shade(cc,-.3));                                   // candle shadow edge
+    if(on){                                                                       // warm glowing flame
+      const fl=(Math.floor(t*0.14)+i+4)%2;
+      ctx.save(); ctx.globalAlpha=.4; px(cx-2, cup-17-extra-fl, 5, 7, '#ffcf6b'); ctx.restore(); // halo
+      px(cx-1, cup-15-extra-fl, 3, 5, '#f0a93a'); px(cx-1, cup-16-extra-fl, 3, 2, '#ffe066');
+      px(cx, cup-17-extra-fl, 1, 1, '#fff6d6');                                    // hot tip
+    } else {
+      px(cx-1, cup-13-extra, 3, 2, '#2a2a30');                                     // unlit wick stub
+    }
+  }
+  ctx.restore();
+}
+function drawDreidel(x,y){
+  px(x-4,y,8,8,'#2f74d6'); px(x-4,y,8,1,'#5a9ae0'); px(x-4,y+7,8,1,'#1f3f8c'); // body
+  px(x-1,y-4,2,4,'#3f64c0');                                                     // handle
+  px(x-2,y+8,4,1,'#1f3f8c'); px(x-1,y+9,2,2,'#1f3f8c');                          // point
+  px(x-1,y+2,2,4,'#ffd84d'); px(x-2,y+3,1,2,'#ffd84d');                          // painted letter
+}
+// a spinning dreidel for the swirl overlay: `squash` (0..1) narrows the body to fake a
+// fast spin, `col` picks the body colour. Same silhouette as the static one, drawn about (x,y).
+function drawSpinDreidel(x,y,squash,col,colH,colD){
+  const hw=Math.max(1, Math.round(4*squash));                                     // half-width (spins thin<->wide)
+  px(x-hw,y,hw*2,8,col); px(x-hw,y,hw*2,1,colH); px(x-hw,y+7,hw*2,1,colD);         // body
+  px(x-1,y-4,2,4,colH);                                                           // handle
+  px(x-2,y+8,4,1,colD); px(x-1,y+9,2,2,colD);                                     // point
+  if(hw>=3){ px(x-1,y+2,2,4,'#ffd84d'); px(x-2,y+3,1,2,'#ffd84d'); }              // painted letter (when facing us)
+}
+
+// --- Thanksgiving: turkey + autumn leaves ---
+function drawTurkey(x,by){
+  const body='#7a4a28', bodyH='#9a6238', bodyD='#5e3820';
+  const fc=['#c0392b','#e07a2f','#e3b021','#d98f2a','#b85e20'];
+  for(let i=0;i<5;i++){ const dx=(i-2)*7; px(x+dx-2, by-30, 4, 16, fc[i]); px(x+dx-2,by-30,4,2,shade(fc[i],.3)); } // tail fan
+  px(x-7, by-16, 14, 14, body); px(x-7,by-16,14,2,bodyH); px(x-7,by-4,14,2,bodyD);  // body
+  px(x-1, by-24, 4, 9, body); px(x-2, by-27, 6, 4, body);                           // neck + head
+  px(x, by-25, 2,2, '#1a1208'); px(x+4, by-25, 3,2, '#e3b021'); px(x+2, by-22, 2,3, '#c0392b'); // eye/beak/wattle
+  px(x-4, by-2, 2,3, '#e3b021'); px(x+2, by-2, 2,3, '#e3b021');                      // feet
+}
+function drawLeafPile(x,by){
+  const lc=['#c0392b','#e07a2f','#e3b021','#b85e20'];
+  for(let i=0;i<9;i++){ const lx=x+((i*53)%44)-22, ly=by-((i*29)%9);
+    px(lx,ly,3,2,lc[i%4]); px(lx+1,ly-1,1,1,shade(lc[i%4],.3)); }
+}
+function drawFallLeaves(t){
+  const lc=['#c0392b','#e07a2f','#e3b021','#b85e20'];
+  ctx.save();
+  for(let i=0;i<22;i++){
+    const sp=0.5+((i*13)%10)/10*0.7;
+    const y=((t*sp*5 + i*71) % (H+20)) - 10;
+    const x=((i*101)%W) + Math.sin((t*0.015)+i)*14;
+    ctx.globalAlpha=0.65;
+    px(x|0, y|0, 3, 2, lc[i%4]);
+  }
+  ctx.restore();
+}
+// --- Thanksgiving centerpiece: a BIG golden roast turkey on a silver platter, sitting
+// on the kitchen lounge table. `by` is the platter's resting line on the table surface.
+// Drawn after the table (in drawHolidayBack) so it reads as the holiday centerpiece. ---
+function drawRoastTurkey(cx, by, t){
+  const el=(ex,ey,rx,ry,col)=>{ ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(ex,ey,rx,ry,0,0,Math.PI*2); ctx.fill(); };
+  // silver platter (shadow + dish + rim highlight + inner well)
+  el(cx, by+5, 36, 7, 'rgba(0,0,0,.20)');                                   // floor/table shadow
+  el(cx, by+2, 35, 8, '#b7bcc4'); el(cx, by, 33, 7, '#d8dbe1');             // dish body + rim
+  el(cx, by-1, 29, 5, '#eef0f3'); el(cx, by+1, 24, 4, '#aeb3bb');           // rim sheen + inner well
+  // garnish tucked around the base: parsley sprigs + cranberries
+  for(let i=-3;i<=3;i++){ const gx=cx+i*9; px(gx, by-1, 3,2,'#3f7a3c'); px(gx+1,by-2,1,1,'#5a9a4a'); }
+  px(cx-24,by-1,2,2,'#c0392b'); px(cx-12,by-2,2,2,'#c0392b'); px(cx+9,by-2,2,2,'#c0392b'); px(cx+22,by-1,2,2,'#c0392b');
+  // roasted body: a big glistening golden-brown mound
+  const br='#b5712b', brH='#d59445', brHH='#eab868', brD='#8a5420';
+  el(cx, by-5, 25, 15, brD);                                                // underside / shadow tone
+  el(cx, by-7, 24, 14, br);                                                 // main body
+  el(cx-3, by-10, 18, 9, brH);                                             // upper roast sheen
+  el(cx-6, by-13, 9, 4, brHH);                                             // hottest highlight
+  px(cx+12, by-9, 7, 8, brD); px(cx+13,by-9,5,2,br);                        // far wing/thigh bulge
+  // two drumsticks rising from the body with little white paper frills on the bone tips
+  // left drumstick (angled up-left)
+  el(cx-15, by-15, 6, 7, br); px(cx-15,by-18,5,3,brH);
+  px(cx-19, by-24, 4, 7, br); px(cx-19,by-24,4,2,brH);                      // bone
+  px(cx-21, by-27, 8, 4, '#f1efe8'); px(cx-21,by-27,8,1,'#ffffff');         // paper frill
+  // right drumstick (angled up-right)
+  el(cx+15, by-15, 6, 7, br); px(cx+11,by-18,5,3,brH);
+  px(cx+16, by-24, 4, 7, br); px(cx+16,by-24,4,2,brH);                      // bone
+  px(cx+14, by-27, 8, 4, '#f1efe8'); px(cx+14,by-27,8,1,'#ffffff');         // paper frill
+  // trussing string across the body + a couple of score marks
+  px(cx-8, by-9, 16, 1, brD); px(cx-6, by-6, 3,1, brD); px(cx+4, by-6, 3,1, brD);
+  // rising steam: three gently wavering dotted plumes (animated off the rAF clock)
+  ctx.save();
+  for(let s=0;s<3;s++){ const sx0=cx-12+s*12;
+    for(let k=0;k<4;k++){ const yy=by-20-k*6-((t*0.6+s*7)%6);
+      const sx=sx0+Math.sin(t*0.02+k*0.8+s)*3;
+      ctx.globalAlpha=0.30+0.12*((k+1)%3);
+      px(sx|0, yy|0, 2, 2, '#ffffff'); }
+  }
+  ctx.restore();
+}
+
+// --- New Year's: fireworks + a hanging banner + confetti ---
+// the year being rung in: the nearest Jan 1 (Dec -> next year, Jan -> this year).
+function newYearYear(){ const n=new Date(); return n.getMonth()>=6 ? n.getFullYear()+1 : n.getFullYear(); }
+// one firework on a launch->burst cycle. prog 0..1: a rising rocket then a bright,
+// fading starburst (a hot white core + coloured rays with brighter inner trails).
+function drawFirework(cx,cy,prog,col){
+  ctx.save();
+  if(prog<0.30){                                                   // rising rocket + short trail
+    const y=cy + (1-prog/0.30)*72;
+    ctx.globalAlpha=0.95; px(cx-1, y|0, 2,3, '#fffbe0');
+    ctx.globalAlpha=0.40; px(cx|0, (y+4)|0, 1,5, col);
+  } else {                                                         // radial burst that expands + fades
+    const p=(prog-0.30)/0.70, n=16, R=4+p*40, fade=Math.max(0,1-p);
+    for(let i=0;i<n;i++){ const a=i/n*Math.PI*2, c=Math.cos(a), s=Math.sin(a)*0.92;
+      ctx.globalAlpha=fade;        px((cx+c*R)|0,      (cy+s*R)|0,      2,2, col);       // outer spark
+      ctx.globalAlpha=fade*0.8;    px((cx+c*R*0.62)|0, (cy+s*R*0.62)|0, 2,2, '#fff6c0'); // inner bright trail
+    }
+    ctx.globalAlpha=fade;     px(cx-2,cy-2,4,4,'#ffffff');         // hot white core flash
+    ctx.globalAlpha=fade*0.5; px(cx-3,cy-3,6,6,col);              // coloured halo around the core
+  }
+  ctx.restore();
+}
+function drawFireworks(t){
+  const cols=['#f0c33b','#e23b3b','#3fa0e0','#e673a8','#3fae55','#d4af37','#ff9a3c'];
+  // [x, y, cycle-length, phase-offset] -- varied periods so bursts overlap organically
+  // (a few in the sky at once) rather than all firing in unison.
+  const fw=[[W*0.09,56,150,0],[W*0.19,34,178,40],[W*0.29,66,162,96],[W*0.39,44,190,20],
+            [W*0.49,58,158,130],[W*0.58,40,172,70],[W*0.67,62,166,110],[W*0.76,36,154,52],
+            [W*0.85,60,184,88],[W*0.93,46,168,24]];
+  for(let i=0;i<fw.length;i++){
+    const prog=((t*0.6 + fw[i][3])%fw[i][2])/fw[i][2];
+    drawFirework(fw[i][0]|0, fw[i][1]|0, prog, cols[i%cols.length]);
+  }
+}
+function drawConfetti(t){
+  const cc=['#f0c33b','#e23b3b','#3fa0e0','#e673a8','#3fae55','#ffffff','#d4af37'];
+  ctx.save();
+  for(let i=0;i<48;i++){
+    const sp=0.4+((i*11)%10)/10*0.8;
+    const y=((t*sp*5 + i*61)%(H+20))-10;
+    const x=((i*83)%W)+Math.sin((t*0.02)+i)*10;
+    ctx.globalAlpha=0.72;
+    px(x|0, y|0, (i%3===0)?3:2, 2, cc[i%cc.length]);
+  }
+  ctx.restore();
+}
+
+// --- Christmas surprise: wrapped gifts periodically POP into the scene, sit a beat, then
+// "explode" into a burst of colourful confetti and fade. Pure scenery. State is driven off
+// performance.now() deadlines; a hard cap on live gifts (and a fixed particle count each)
+// keeps it cheap. ---
+const GIFT_COLS=['#e23b3b','#3fae55','#f0c33b','#3fa0e0','#e673a8','#ffffff','#d4af37','#ff9a3c'];
+const GIFT_MAX=4, GIFT_PARTS=24;          // hard caps: <=4 live gifts, 24 particles each (<=96)
+let xmasGifts=[]; let nextGiftAt=0;
+function spawnGift(now){
+  // scatter spawn points across the back-wall band just above the desks (clear of the
+  // window + inspiration board), so gifts pop against the wall rather than over agents
+  const spots=[[W*0.16,100],[W*0.30,86],[W*0.44,104],[W*0.58,88],[W*0.72,106],[W*0.86,92],[W*0.50,112]];
+  const s=spots[(Math.random()*spots.length)|0];
+  const parts=[];
+  for(let i=0;i<GIFT_PARTS;i++) parts.push({a:(i/GIFT_PARTS)*Math.PI*2+Math.random()*0.3,
+                                            sp:48+Math.random()*78, col:GIFT_COLS[(Math.random()*GIFT_COLS.length)|0]});
+  xmasGifts.push({ x:s[0]|0, y:s[1]|0, wrap:GIFT_COLS[(Math.random()*4)|0],
+                   bornAt:now, popAt:now+650+Math.random()*700, doneAt:0, parts });
+}
+function drawGiftBox(x,y,col,s){
+  const w=Math.max(2,Math.round(16*s)), h=Math.max(2,Math.round(15*s)), hw=w>>1;
+  ro(x-hw, y-h, w, h, col); px(x-hw, y-h, w, Math.max(1,h*0.34|0), shade(col,.28)); // box + lid sheen
+  px(x-1, y-h-3, 2, h+3, '#ffe066');                                                // vertical ribbon
+  px(x-hw, y-Math.round(h*0.55), w, 2, '#ffe066');                                  // horizontal ribbon
+  px(x-3, y-h-4, 2,2, '#ffd84d'); px(x+1, y-h-4, 2,2, '#ffd84d'); px(x-1,y-h-3,2,1,'#fff2a8'); // bow
+}
+function drawXmasGifts(){
+  const now=performance.now();
+  if(now>=nextGiftAt){ if(xmasGifts.length<GIFT_MAX) spawnGift(now); nextGiftAt=now+1600+Math.random()*2600; }
+  ctx.save();
+  for(let i=xmasGifts.length-1;i>=0;i--){ const g=xmasGifts[i];
+    if(now<g.popAt){                                                  // wrapped gift present (scale-in + pre-pop shake)
+      const appear=Math.min(1,(now-g.bornAt)/160);
+      const near=Math.max(0,(now-(g.popAt-240))/240);                 // 0..1 as it nears the pop
+      const sx=Math.sin(now*0.05)*2*near;
+      drawGiftBox((g.x+sx)|0, g.y, g.wrap, appear);
+    } else {                                                          // exploded: big confetti burst + fade
+      if(!g.doneAt) g.doneAt=now+1100;
+      if(now>=g.doneAt){ xmasGifts.splice(i,1); continue; }
+      const age=(now-g.popAt)/1000, p=(now-g.popAt)/(g.doneAt-g.popAt), fade=Math.max(0,1-p);
+      const cy=g.y-7;
+      if(p<0.28){ const f=1-p/0.28;                                   // bright central flash
+        ctx.globalAlpha=f; px(g.x-5,cy-5,10,10,'#ffffff'); px(g.x-8,cy-8,16,16,'#fff6c0'); ctx.globalAlpha=0.5*f; px(g.x-11,cy-11,22,22,'#ffd84d'); }
+      for(const pt of g.parts){
+        const dx=Math.cos(pt.a)*pt.sp*age, dy=Math.sin(pt.a)*pt.sp*age + 80*age*age; // radial + gravity
+        const x0=(g.x+dx)|0, y0=(cy+dy)|0;
+        ctx.globalAlpha=fade*0.5; px((g.x+dx*0.7)|0,(cy+dy*0.7)|0,2,2,'#ffffff');    // inner trail spark
+        ctx.globalAlpha=fade;     px(x0,y0,3,3,pt.col); px(x0+1,y0+1,1,1,shade(pt.col,.5)); // bright 3x3 confetti
+      }
+      ctx.globalAlpha=1;
+    }
+  }
+  ctx.restore();
+}
+
+// --- Hanukkah surprise: spinning dreidels periodically swirl across the screen on a wavy
+// path, then drift off the far edge and expire. Pure overlay; hard-capped live count. ---
+const DREIDEL_COLS=[['#2f74d6','#5a9ae0','#1f3f8c'],['#d94f4f','#f08a8a','#9c2f2f'],
+                    ['#d4af37','#f2dd88','#9c7d1f'],['#49a86a','#7fd49a','#2f7047']];
+const DREIDEL_MAX=3;
+let dreidels=[]; let nextDreidelAt=0;
+function drawDreidelSwirl(){
+  const now=performance.now();
+  if(now>=nextDreidelAt){
+    if(dreidels.length<DREIDEL_MAX){
+      dreidels.push({ bornAt:now, dur:4200+Math.random()*2800, y0:48+Math.random()*150,
+                      dir:(Math.random()<0.5?1:-1), amp:14+Math.random()*22,
+                      col:DREIDEL_COLS[(Math.random()*DREIDEL_COLS.length)|0] });
+    }
+    nextDreidelAt=now+2200+Math.random()*3200;
+  }
+  ctx.save();
+  for(let i=dreidels.length-1;i>=0;i--){ const d=dreidels[i];
+    const p=(now-d.bornAt)/d.dur; if(p>=1){ dreidels.splice(i,1); continue; }
+    const x=(d.dir>0) ? p*(W+48)-24 : (W+24)-p*(W+48);
+    const y=d.y0 + Math.sin(p*Math.PI*4)*d.amp;
+    const squash=Math.abs(Math.sin(now*0.02));                        // fake fast spin
+    const edge=Math.min(1, p/0.1, (1-p)/0.1);                         // fade in/out at the edges
+    ctx.globalAlpha=0.9*edge;
+    drawSpinDreidel(x|0, y|0, squash, d.col[0], d.col[1], d.col[2]);
+  }
+  ctx.restore();
+}
+
+// --- New Year: a glowing neon sign that sits on the office WINDOW glass (not the board),
+// plus extra party decor (streamers, balloons, sparkles). ---
+// neon text with a soft halo + bright core + flicker. (cx,cy) is the text baseline centre.
+function neonText(txt, cx, cy, size, col, glow, a){
+  ctx.save(); ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+  ctx.font=size+'px "Press Start 2P", monospace';
+  ctx.globalAlpha=0.30*a; ctx.fillStyle=glow;                         // offset halo
+  ctx.fillText(txt,cx-1,cy); ctx.fillText(txt,cx+1,cy); ctx.fillText(txt,cx,cy-1); ctx.fillText(txt,cx,cy+1);
+  ctx.globalAlpha=a; ctx.shadowColor=glow; ctx.shadowBlur=7; ctx.fillStyle=col; // blurred neon glow
+  ctx.fillText(txt,cx,cy); ctx.shadowBlur=0;
+  ctx.globalAlpha=Math.min(1,a+0.1); ctx.fillStyle='#ffffff'; ctx.fillText(txt,cx,cy); // bright hot core
+  ctx.restore();
+}
+function drawNewYearNeon(){
+  const now=performance.now();
+  let flick=0.82+0.18*Math.sin(now*0.02);                             // gentle breathing glow
+  if(((now*0.2|0)%61)===0) flick=0.45;                                // occasional stutter
+  const cx=WIN.x+Math.round(WIN.w*0.5);
+  // thin neon tube frame hugging the lower window, so the sign reads as mounted on the glass
+  ctx.save();
+  ctx.globalAlpha=0.5*flick; ctx.strokeStyle='#ff7ad8'; ctx.lineWidth=1;
+  ctx.shadowColor='#ff7ad8'; ctx.shadowBlur=6;
+  ctx.strokeRect(WIN.x+8, WIN.y+14, WIN.w-16, WIN.h-18); ctx.shadowBlur=0; ctx.restore();
+  neonText('HAPPY NEW YEAR', cx, WIN.y+Math.round(WIN.h*0.42), 6, '#67f0ff', '#2fd6ff', flick);
+  neonText(String(newYearYear()), cx, WIN.y+Math.round(WIN.h*0.80), 10, '#ffe066', '#ff8ad0', flick);
+}
+// diagonal party streamers hung from the top corners (back scenery)
+function drawStreamers(t){
+  const cols=['#ff5a5a','#5ab0ff','#f0c33b','#5ae07a','#e673a8','#d4af37'];
+  ctx.save();
+  for(let s=0;s<6;s++){
+    const fromLeft=(s%2===0), x0=fromLeft?2+s*3:W-2-s*3, col=cols[s%cols.length];
+    for(let k=0;k<16;k++){ const prog=k/16;
+      const x=x0 + (fromLeft?1:-1)*prog*(28+s*5);
+      const y=2 + prog*(40+s*4) + Math.sin(t*0.05 + s + k*0.5)*2;      // gentle wave
+      ctx.globalAlpha=0.8-prog*0.4; px(x|0, y|0, 2,2, col);
+    }
+  }
+  ctx.restore();
+}
+// a few bobbing balloons tethered in the upper corners (back scenery)
+function drawBalloon(x,y,col){
+  ro(x-4, y, 8, 10, col); px(x-3,y+1,2,4,shade(col,.45));             // body + sheen
+  px(x-1, y+10, 2, 2, shade(col,-.3)); px(x-1, y+12, 1, 6, 'rgba(230,230,240,.6)'); // knot + string
+}
+function drawBalloons(t){
+  const b=[[W*0.09,30,'#ff5a5a'],[W*0.15,24,'#5ab0ff'],[W*0.07,52,'#f0c33b'],
+           [W*0.93,28,'#5ae07a'],[W*0.88,22,'#e673a8'],[W*0.95,50,'#d4af37']];
+  for(let i=0;i<b.length;i++){ const bob=Math.sin(t*0.06+i*1.3)*3;
+    drawBalloon(b[i][0]|0, (b[i][1]+bob)|0, b[i][2]); }
+}
+// twinkling sparkles scattered high in the scene (overlay)
+function drawSparkles(t){
+  ctx.save();
+  for(let i=0;i<26;i++){
+    const x=(i*97)%W, y=10+((i*53)%120);
+    const tw=0.5+0.5*Math.sin(t*0.2 + i*1.7);
+    if(tw<0.35) continue;
+    ctx.globalAlpha=tw; const c=(i%3===0)?'#ffe066':(i%3===1)?'#67f0ff':'#ffffff';
+    px(x,y,1,1,c); px(x-1,y,1,1,c); px(x+1,y,1,1,c); px(x,y-1,1,1,c); px(x,y+1,1,1,c); // little plus-spark
+  }
+  ctx.restore();
+}
+
+// background holiday decor: a single ambient tint (from the nearest holiday) + each active
+// theme's always-visible light string and corner centerpiece. Drawn before the desks.
+function drawHolidayBack(t){
+  if(!activeHolidays.length) return;
+  const L=layout(), by=L.kitchenTop-6, night=(skyMode()==='night');
+  const tints={ halloween:[60,28,78], thanksgiving:[196,112,40], christmas:[120,150,205], hanukkah:[60,95,190], newyear:[40,52,120] };
+  const tc=tints[activeHolidays[0]];                                  // nearest holiday drives the tint
+  if(tc){ ctx.save();
+    ctx.globalAlpha=(activeHolidays[0]==='halloween') ? (night?.22:.14) : (night?.14:.09);
+    ctx.fillStyle='rgb('+tc[0]+','+tc[1]+','+tc[2]+')'; ctx.fillRect(0,0,W,L.kitchenTop); ctx.restore(); }
+  activeHolidays.forEach((h,i)=>{
+    const ly=WALL_H-4-i*5;                                            // stack garlands if themes overlap
+    if(h==='halloween'){
+      drawLightString(ly,['#e07a2f','#8c5fd6'],t);
+      drawCobweb(1,WALL_H+1,false); drawCobweb(W-1,WALL_H+1,true);
+      drawPumpkin(40,by); drawPumpkin(66,by+2); drawPumpkin(W-42,by);
+    } else if(h==='christmas'){
+      drawLightString(ly,['#e23b3b','#3fae55','#f0c33b','#3fa0e0'],t);
+      drawLightString(ly-3,['#ffdf6b','#ff5a5a','#5ab0ff'],t);         // a second, denser garland
+      drawXmasTree(46,by,t,1.6);                                      // big left tree (scaled up 1.6x, nudged into the left corner)
+      drawXmasTree(W-38,by+4,t,1.35);                                 // a smaller matching tree on the right (scaled up 1.35x)
+    } else if(h==='hanukkah'){
+      drawLightString(ly,['#2f74d6','#ffffff','#5a9ae0'],t);
+      drawLightString(ly-3,['#ffffff','#5a9ae0','#2f74d6'],t);
+      drawMenorah(W-66,by,hanukkahNight,t,1.6); drawDreidel(W-130,by-2); drawDreidel(W-14,by-1);
+    } else if(h==='thanksgiving'){
+      drawLightString(ly,['#e3b021','#e07a2f','#b85e20'],t);
+      drawTurkey(52,by); drawLeafPile(W-58,by); drawLeafPile(118,by+2);
+      // the big roast-turkey centerpiece sits on the kitchen lounge table (tx=66, ty=T+150,
+      // tw=116 in drawKitchenProps) -- centre it on the table's near surface edge.
+      drawRoastTurkey(66+116/2, L.kitchenTop+150+3, t);
+    } else if(h==='newyear'){
+      drawLightString(ly,['#d4af37','#ffffff','#f0c33b','#bcd4ff'],t);
+      drawLightString(ly-3,['#ff7ad8','#67f0ff','#ffe066'],t);        // extra sparkly garland
+      drawStreamers(t);                                              // diagonal party streamers in the corners
+      drawBalloons(t);                                               // bobbing balloons tethered up high
+      drawFireworks(t);                                              // celebratory bursts up in the sky
+      drawNewYearNeon();                                             // glowing neon sign on the WINDOW glass
+    }
+  });
+}
+// foreground holiday "weather": falling snow / drifting bats / tumbling leaves. Overlay.
+function drawHolidayWeather(t){
+  if(!activeHolidays.length) return;
+  for(const h of activeHolidays){
+    if(h==='christmas'){ drawSnow(t,'#ffffff'); drawXmasGifts(); }    // snow + periodic exploding gifts
+    else if(h==='hanukkah'){ drawSnow(t,'#bcd4ff'); drawDreidelSwirl(); } // snow + swirling dreidels
+    else if(h==='halloween') drawBats(t);
+    else if(h==='thanksgiving') drawFallLeaves(t);
+    else if(h==='newyear'){ drawConfetti(t); drawSparkles(t); }       // confetti + twinkling sparkles
+  }
+}
+// =============================================================================
+
 function render(t){
   helperHits = [];                   // rebuilt each frame as dwarves are drawn
   workflowHits = [];                 // rebuilt each frame as workflow tents are drawn
@@ -4223,22 +5102,25 @@ function render(t){
   ctx.setTransform(SS,0,0,SS,0,0);   // map logical 640x576 onto the super-sampled backing
   ctx.clearRect(0,0,W,H);
   drawFloor();
+  drawHolidayBack(t);                 // seasonal tint + back-wall / corner decorations
+  drawRooms();                        // light "work room" dividers + labels (large grids only)
   // office desks (always shown); seated worker drawn only once docked, otherwise
   // the desk is shown empty and the worker is drawn separately as a walker.
   const bt = performance.now();
   const slots=[...deskSlots].sort((a,b)=>a.y-b.y);
-  for(const s of slots){ const w=s.worker;
-    ctx.save(); scaleAbout(s.x, s.y, SC); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t); ctx.restore();
-    if(w && w.seated && w.bubbleUntil>bt && !bossActive(w.id)) bubbleAnchors.push({x:s.x, y:s.y-30*SC, text:w.bubbleText, start:w.bubbleStart, until:w.bubbleUntil, tool:w.bubbleTool}); }
+  for(const s of slots){ const w=s.worker; const ds=s.scale||SC;
+    ctx.save(); scaleAbout(s.x, s.y, ds); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t, ds); ctx.restore();
+    if(w && w.seated && w.bubbleUntil>bt && !bossActive(w.id)) bubbleAnchors.push({x:s.x, y:s.y-30*ds, text:w.bubbleText, start:w.bubbleStart, until:w.bubbleUntil, tool:w.bubbleTool}); }
   // everyone currently standing/walking (kitchen agents + workers still walking in),
   // interleaved with the ambient dog/cat so overlaps sort correctly by y (painter's).
   const drawList=[];
   people.filter(p=> p.kind!=='work' || !p.seated).forEach(p=> drawList.push({y:p.y, p}));
   if(amb.dog) drawList.push({y:amb.dog.y, dog:amb.dog});
   if(amb.cat) drawList.push({y:amb.cat.y, cat:amb.cat});
+  if(amb.turkeys) for(const tk of amb.turkeys) drawList.push({y:tk.y, turkey:tk});
   drawList.sort((a,b)=>a.y-b.y);
   for(const e of drawList){
-    if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
+    if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, pscale(e.p));
       // beach agents sit (with shades + cocktail) once settled; still walk in standing
       if(e.p.mode==='drown' && e.p.sinking) drawDrowning(e.p, e.p.sinkT||0);
       else if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t);
@@ -4258,6 +5140,7 @@ function render(t){
       if(e.p.bubbleUntil>bt && !bossActive(e.p.id)) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil, tool:e.p.bubbleTool}); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
+    else if(e.turkey) drawTurkeyRunner(e.turkey, t);
   }
   // supervisor "boss" visits: a stern suited figure delivering a fresh user instruction.
   // The boss ESCORTS the agent -- it appears the moment the instruction lands and walks
@@ -4287,11 +5170,12 @@ function render(t){
     if(b.tool) drawToolChip(b.x, b.y, b.text, Math.min(fin,fout), b.below);
     else drawBubble(b.x, b.y, b.text, Math.min(fin,fout), b.below);
   }
-  // hover ring (around the drawn sprite, scaled to match SC)
+  // hover ring (around the drawn sprite, scaled to match the sprite's draw scale)
   if(hover){
+    const hs=pscale(hover);
     ctx.strokeStyle='#ffffff'; ctx.lineWidth=2;
-    if(hover.kind==='work' && hover.seated) ctx.strokeRect(hover.deskX-24*SC, hover.deskY-33*SC, 48*SC, 56*SC);
-    else ctx.strokeRect(Math.round(hover.x)-14*SC, Math.round(hover.y)-31*SC, 28*SC, 51*SC);
+    if(hover.kind==='work' && hover.seated) ctx.strokeRect(hover.deskX-24*hs, hover.deskY-33*hs, 48*hs, 56*hs);
+    else ctx.strokeRect(Math.round(hover.x)-14*hs, Math.round(hover.y)-31*hs, 28*hs, 51*hs);
   }
   // subtle dot-matrix vignette (kept faint + crisp so text/sprites stay readable)
   if(!render._vig){
@@ -4327,7 +5211,7 @@ function render(t){
       if(p.x==null || p.kind==='beach' || p.mode==='drown') continue;
       const seated=(p.kind==='work' && p.seated);
       const hx=seated ? p.deskX : p.x;
-      const hy=(seated ? p.deskY-30*SC : p.y-34*SC);
+      const hy=(seated ? p.deskY-30*pscale(p) : p.y-34*SC);
       const seed=((p.deskX||p.x||0)*7)|0;
       for(let k=0;k<2;k++){
         const ph=((bnow*0.0006 + k*0.5 + seed*0.013)%1 + 1)%1;  // 0->1 rising loop
@@ -4395,6 +5279,7 @@ function render(t){
     drawPoop(x, y, sz, q.rot, 1);
   }
   ctx.globalAlpha=1;
+  drawHolidayWeather(t);              // seasonal snow / bats / leaves overlay (pure scenery)
 }
 
 // burst ~110 confetti pieces: half from the agent's head, half across the whole screen
@@ -4680,6 +5565,35 @@ function updateAmbient(now, dt){
   else if(now>=nextPlaneAt){ if(!amb.plane) startPlane(now); schedulePlane(now); }
   if(amb.plane){ const pl=amb.plane; pl.x += pl.dir*pl.spd*sec;
     if((pl.dir>0 && pl.x>WIN.x+WIN.w+24) || (pl.dir<0 && pl.x<WIN.x-24)) amb.plane=null; }
+  // Thanksgiving: a small flock of turkeys scurries across the floor the whole time the
+  // theme is active (holiday-gated -- they never appear in a plain office or other theme).
+  // Each runs edge-to-edge, then re-enters from the far side on a fresh lane/speed so the
+  // flock keeps "running around". Pure scenery: never hit-tested, like the dog/cat.
+  if(activeHolidays.includes('thanksgiving')){
+    if(!amb.turkeys) amb.turkeys=[];
+    while(amb.turkeys.length<3) amb.turkeys.push(spawnTurkey());
+    for(const tk of amb.turkeys){
+      tk.x += tk.dir*tk.spd*sec;
+      if(tk.dir>0 && tk.x>W+30) respawnTurkey(tk,-1);
+      else if(tk.dir<0 && tk.x<-30) respawnTurkey(tk,1);
+    }
+  } else if(amb.turkeys){ amb.turkeys=null; }   // clear the flock when Thanksgiving ends
+}
+
+// ---- Thanksgiving turkey flock (holiday-gated scenery) ----
+function turkeyLaneY(){
+  const L=layout();                                   // roam the front office lane + kitchen floor
+  const lo=L.kitchenTop-34, hi=H-22;
+  return lo + Math.random()*(hi-lo);
+}
+function spawnTurkey(){
+  const dir = Math.random()<0.5 ? 1 : -1;
+  return { dir, x: dir>0 ? -30 : W+30, y: turkeyLaneY(),
+           spd: 92 + Math.random()*54, ph: Math.random()*6.28 };   // ph: per-turkey leg-cadence offset
+}
+function respawnTurkey(tk, dir){
+  tk.dir=dir; tk.x = dir>0 ? -30 : W+30; tk.y=turkeyLaneY();
+  tk.spd = 92 + Math.random()*54;
 }
 
 // ---------- pixel-art critters (drawn scaled by SC about their anchor) ----------
@@ -4856,6 +5770,38 @@ function drawCat(c, t){
   ctx.restore();
 }
 
+// TURKEY: a plump side-on turkey mid-run -- fan tail (back), round brown body, shuffling
+// legs + head bob so it reads as scurrying. Faces its travel direction. Pure scenery.
+function drawTurkeyRunner(tk, t){
+  ctx.save();
+  scaleAbout(tk.x, tk.y, SC);
+  if(tk.dir<0){ ctx.translate(tk.x,0); ctx.scale(-1,1); ctx.translate(-tk.x,0); }   // art faces +x; flip to go left
+  const x=tk.x, body='#7a4a28', bodyH='#9a6238', bodyD='#5e3820';
+  const fc=['#c0392b','#e07a2f','#e3b021','#d98f2a','#b85e20'];
+  const run=t*0.045 + tk.ph;                              // leg/run cadence
+  const ph=(Math.sin(run)>0)?1:-1;                        // alternate the two legs
+  const bob=Math.round(Math.abs(Math.sin(run))*2);        // little vertical hop while running
+  const y=tk.y-bob;
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x, tk.y+1, 12, 3, 0, 0, Math.PI*2); ctx.fill(); // ground shadow
+  // tail fan spread behind the body (-x side)
+  for(let i=0;i<5;i++){ const fy=y-15+(i-2)*3; px(x-16, fy, 6, 3, fc[i%5]); px(x-16, fy, 6, 1, shade(fc[i%5],.3)); }
+  px(x-11, y-14, 4, 11, bodyD);                           // tail base shadow
+  // body
+  px(x-8, y-14, 16, 12, body); px(x-8, y-14, 16, 2, bodyH); px(x-8, y-4, 16, 2, bodyD);
+  px(x-4, y-10, 9, 5, shade(body,-.12));                  // folded wing
+  // legs (running shuffle)
+  _leg(x-3, y-2, 6+ph*2, 2, '#e3b021'); _leg(x+3, y-2, 6-ph*2, 2, '#d98f2a');
+  px(x-5, y-2+(6+ph*2), 4, 1, '#e3b021'); px(x+1, y-2+(6-ph*2), 4, 1, '#d98f2a');   // feet
+  // neck + head (front +x) with a small bob, beak, red wattle + eye
+  const hb=(Math.sin(run*1.3)>0)?1:0, hx=x+7, hy=y-20-hb;
+  px(x+4, y-17, 4, 6, body);                              // neck
+  px(hx, hy, 6, 5, body); px(hx, hy, 6, 1, bodyH);        // head
+  px(hx+5, hy+2, 3, 2, '#e3b021');                        // beak
+  px(hx+3, hy+4, 2, 4, '#c0392b');                        // dangling red wattle
+  px(hx+2, hy+1, 1, 1, '#1a1208');                        // eye
+  ctx.restore();
+}
+
 // ---- petting the ambient pets ----
 function miniHeart(hx,hy){ px(hx-2,hy,2,2,PAL.pink); px(hx+1,hy,2,2,PAL.pink); px(hx-2,hy+1,5,2,PAL.pink); px(hx-1,hy+3,3,1,PAL.pink); px(hx,hy+4,1,1,PAL.pink); }
 // which pet (if any) is under the cursor -- cat first, then dog
@@ -4898,10 +5844,12 @@ function pick(mx,my){
     const sy = seatedWorker ? p.deskY : p.y;
     const dx=mx-sx;
     let hit;
-    // hitboxes scale with SC (sprites are drawn scaled about their anchor)
-    if(seatedWorker) hit = (Math.abs(dx)<24*SC && my>sy-32*SC && my<sy+22*SC);
-    else             hit = (Math.abs(dx)<15*SC && my>sy-32*SC && my<sy+18*SC); // standing
-    if(hit){ const cy=sy-12*SC, d=dx*dx+(my-cy)*(my-cy); if(d<bd){bd=d;best=p;} }
+    // hitboxes scale with the sprite's own draw scale (SC, or the smaller desk scale for
+    // a worker once the office has grown) so hover/click line up with the drawn pods.
+    const s=pscale(p);
+    if(seatedWorker) hit = (Math.abs(dx)<24*s && my>sy-32*s && my<sy+22*s);
+    else             hit = (Math.abs(dx)<15*s && my>sy-32*s && my<sy+18*s); // standing
+    if(hit){ const cy=sy-12*s, d=dx*dx+(my-cy)*(my-cy); if(d<bd){bd=d;best=p;} }
   }
   return best;
 }
@@ -5043,6 +5991,10 @@ cv.addEventListener('mousemove', e=>{
       (hasSplit ? '' : ('<div class="nt-label">Latest activity</div><div class="nt-text">'+esc(a.latest||a.preview||a.title||'')+'</div>'))+
       '<div class="nt-hint">click to open full session</div>';
     nametag.style.display='block'; placeNametag(m);
+  } else if(inKitchenZone(m.x,m.y)){          // empty kitchen floor -> hint you can list the waiters
+    hover=null; cv.style.cursor='pointer';
+    nametag.innerHTML='<div class="nt-hint">click to see who\u2019s in the kitchen</div>';
+    nametag.style.display='block'; placeNametag(m);
   } else { nametag.style.display='none'; cv.style.cursor='default'; }
 });
 cv.addEventListener('mouseleave',()=>{hover=null;nametag.style.display='none';});
@@ -5056,8 +6008,16 @@ cv.addEventListener('click', e=>{
   const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
   if(slot){ dispenseDrink(slot); return; }
   const p=pick(m.x,m.y);
-  if(p) openDetail(p.agent.id);
+  if(p){ openDetail(p.agent.id); return; }    // an individual sprite -> its detail overlay
+  // the kitchen BACKGROUND (not a sprite/prop/drink/button) -> list who's waiting there
+  if(inKitchenZone(m.x,m.y)) openKitchen();
 });
+// the kitchen scene occupies the bottom band LEFT of the beach divider (BEACH_X). Checked
+// only after every sprite/prop/button pick above, so it never steals their clicks.
+function inKitchenZone(mx,my){
+  const L=layout();
+  return my>=L.kitchenTop && my<=H && mx>=0 && mx<=BEACH_X;
+}
 
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 // compact token count for the hover card ("1.2M tokens" / "840k tokens")
@@ -5094,12 +6054,16 @@ async function openDetail(id){
   if(!d||d.error){ toast('not found'); return; }
   currentDetail=d;
   updateFinishBtn(d.id);
-  document.getElementById('d-name').textContent=nameFor(d.id);
+  // the header is the REAL Cursor session title (falls back to the whimsical name only
+  // when a session has no resolvable name yet); the whimsical character name still shows
+  // as a muted tag in the sub-line and is what the NAMES toggle cycles.
+  document.getElementById('d-name').textContent=(d.title||nameFor(d.id));
   document.getElementById('d-sub').innerHTML=
     '<span class="badge '+d.status+'">'+d.status.toUpperCase()+'</span> '+
     '<span class="badge '+(d.source==='claude'?'src-claude':'src-cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> '+
     (d.scheduled?'<span class="badge scheduled">SCHEDULED</span> ':'')+'&nbsp; '+
-    esc(d.project)+' &nbsp;·&nbsp; '+esc(d.last_activity_rel)+' &nbsp;·&nbsp; '+d.message_count+' msgs';
+    esc(d.project)+' &nbsp;·&nbsp; '+esc(d.last_activity_rel)+' &nbsp;·&nbsp; '+d.message_count+' msgs'+
+    ' &nbsp;·&nbsp; <span id="d-char">'+esc(nameFor(d.id))+'</span>';
   const body=document.getElementById('dbody');
   let html='';
   html+='<section><h4>Task</h4><div class="box role-user">'+esc(d.task_full||d.title||'(none)')+'</div></section>';
@@ -5147,7 +6111,39 @@ async function openDetail(id){
 function closeDetail(){overlay.style.display='none';currentDetail=null;}
 document.getElementById('d-x').addEventListener('click',closeDetail);
 overlay.addEventListener('click',e=>{ if(e.target===overlay) closeDetail(); });
-document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeDetail(); });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeDetail(); closeKitchen(); } });
+
+// ---- kitchen list panel: every agent currently WAITING (in the kitchen) ----
+// Reuses the detail-overlay pattern (DOM panel, PAL colours, click-outside / X / Esc).
+// Rows show the session title + its last message; a row opens that agent's detail overlay.
+const koverlay=document.getElementById('koverlay');
+// graceful one-line truncation for the last-message preview
+function ktrunc(s,n){ s=(s||'').replace(/\s+/g,' ').trim(); return s.length>n ? s.slice(0,n-1).trimEnd()+'\u2026' : s; }
+function openKitchen(){
+  const waiters=people.filter(p=>p.kind==='wait');
+  document.getElementById('k-title').textContent='In the kitchen ('+waiters.length+')';
+  const kb=document.getElementById('kbody');
+  if(!waiters.length){
+    kb.innerHTML='<div class="k-empty">The kitchen is empty.<br>Nobody is waiting on you right now.</div>';
+  } else {
+    kb.innerHTML=waiters.map(p=>{
+      const a=p.agent;
+      const title=a.title||nameFor(a.id)||'(untitled session)';
+      const msg=a.last_message||a.latest||a.preview||'';   // same field the hover card / detail use
+      const msgHtml=msg ? '<div class="k-msg">'+esc(ktrunc(msg,160))+'</div>'
+                        : '<div class="k-msg" style="opacity:.6">(no message yet)</div>';
+      return '<div class="krow" data-id="'+esc(a.id)+'"><div class="k-ttl">'+esc(title)+'</div>'+msgHtml+'</div>';
+    }).join('');
+    kb.querySelectorAll('.krow').forEach(el=>{
+      el.addEventListener('click',()=>{ const id=el.getAttribute('data-id'); closeKitchen(); openDetail(id); });
+    });
+  }
+  kb.scrollTop=0;
+  koverlay.style.display='flex';
+}
+function closeKitchen(){ koverlay.style.display='none'; }
+document.getElementById('k-x').addEventListener('click',closeKitchen);
+koverlay.addEventListener('click',e=>{ if(e.target===koverlay) closeKitchen(); });
 
 // mark / unmark an agent as "finished" -> it walks to the beach (or back to work)
 function updateFinishBtn(id){
@@ -5283,6 +6279,15 @@ function toast(msg, opts){ const el=document.getElementById('toast'); el.textCon
 async function refresh(){
   try{
     const res=await fetch('/api/agents'); const data=await res.json();
+    // active holiday theme(s) for the live office. window.__forceHoliday (a name, '' for
+    // none) is a client-side dev override; otherwise trust the server (--holiday/--date).
+    activeHolidays = (window.__forceHoliday!==undefined)
+      ? (window.__forceHoliday ? [window.__forceHoliday] : [])
+      : (data.holidays||[]);
+    // which night of Hanukkah to light (server-computed from the date). A client dev
+    // override (window.__hanukkahNight) wins for local demos; else trust the server.
+    if(window.__hanukkahNight!==undefined) hanukkahNight = window.__hanukkahNight|0;
+    else if(typeof data.hanukkah_night==='number') hanukkahNight = data.hanukkah_night;
     WINDOW_HOURS=data.hours||24; document.getElementById('emh').textContent=WINDOW_HOURS;
     document.getElementById('scope').textContent='scope: '+(data.scope||'all projects');
     // hide drowned agents until they're active again (mtime advanced past the drown stamp),
@@ -5386,7 +6391,10 @@ namesBtn.addEventListener('click',()=>{
   nameStyle=NAME_ORDER[(NAME_ORDER.indexOf(nameStyle)+1)%NAME_ORDER.length];
   localStorage.setItem('office_names', nameStyle);
   updateNamesBtn();
-  if(currentDetail) document.getElementById('d-name').textContent=nameFor(currentDetail.id);  // refresh open card
+  if(currentDetail){                                                     // refresh open card
+    const dc=document.getElementById('d-char'); if(dc) dc.textContent=nameFor(currentDetail.id);
+    if(!currentDetail.title) document.getElementById('d-name').textContent=nameFor(currentDetail.id);
+  }
   toast('names: '+NAME_SETS[nameStyle].label.toLowerCase());
 });
 updateNamesBtn();
@@ -5545,6 +6553,8 @@ class Handler(BaseHTTPRequestHandler):
                     "hours": self.hours,
                     "scope": self.project_filter or "all projects",
                     "agents": agents,
+                    "holidays": current_holidays(),
+                    "hanukkah_night": current_hanukkah_night(),
                 })
                 return
             if path.startswith("/api/agent/"):
@@ -5620,6 +6630,17 @@ def main():
                          "in the kitchen. Working chats are primarily decided by turn state, "
                          "not recency. Default 120.")
     ap.add_argument("--demo", action="store_true", help="show fake workers (no real data)")
+    ap.add_argument("--demo-working", type=int, default=0, metavar="N",
+                    help="TEST HOOK: populate the office with exactly N synthetic WORKING "
+                         "agents (implies --demo) to verify dynamic desk scaling. 0 = off.")
+    ap.add_argument("--holiday", default=None,
+                    choices=["halloween", "christmas", "hanukkah", "thanksgiving",
+                             "newyear", "none"],
+                    help="force a holiday theme regardless of today's date (for demos). "
+                         "'none' forces the plain, un-themed office.")
+    ap.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                    help="treat this date as 'today' when auto-selecting a holiday theme "
+                         "(ignored if --holiday is given).")
     ap.add_argument("--no-open", action="store_true", help="do not auto-open the browser")
     ap.add_argument("--watch", action="store_true",
                     help="dev hot-reload: restart the server (and auto-reload the "
@@ -5643,9 +6664,19 @@ def main():
         return
 
     global SUBAGENT_ACTIVE_SECONDS, SHOW_WORKFLOWS, WATCH_MODE
+    global DEMO_WORKING, HOLIDAY_OVERRIDE, HOLIDAY_DATE
     SUBAGENT_ACTIVE_SECONDS = max(15, args.active_secs)
     SHOW_WORKFLOWS = not args.no_workflows
     WATCH_MODE = args.watch
+    DEMO_WORKING = max(0, args.demo_working)
+    if DEMO_WORKING:
+        args.demo = True
+    HOLIDAY_OVERRIDE = args.holiday
+    if args.date:
+        try:
+            HOLIDAY_DATE = datetime.strptime(args.date, "%Y-%m-%d").date()
+        except ValueError:
+            ap.error("--date must be YYYY-MM-DD")
     if WATCH_MODE:
         _start_watcher()
 
