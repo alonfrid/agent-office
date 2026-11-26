@@ -8,7 +8,8 @@ It reads **both** Cursor and Claude Code sessions from your machine and shows th
 together — hover any worker to see which tool it belongs to (teal = Cursor,
 coral = Claude Code), its live token/spend/model, its task, and your last instruction.
 
-![screenshot](docs/screenshot.png)
+
+<img width="1600" height="1395" alt="image" src="https://github.com/user-attachments/assets/007083e6-52b0-40d0-9ae6-9ec6e0b442c3" />
 
 
 ## Why
